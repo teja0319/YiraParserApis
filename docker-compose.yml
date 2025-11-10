@@ -3,7 +3,7 @@ version: '3.8'
 services:
   medical-parser-api:
     build: .
-    container_name: medical-parser-api
+    container_name: medical-parser-api-V2
     ports:
       - "8090:8090"
     environment:
