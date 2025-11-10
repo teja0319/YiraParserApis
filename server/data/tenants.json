@@ -1,0 +1,74 @@
+{
+  "city-general-demo": {
+    "tenant_id": "city-general-demo",
+    "name": "City General Hospital (Demo)",
+    "email": "admin@citygeneral.com",
+    "api_key": "sk_city_general_demo_abc123xyz",
+    "created_at": "2025-10-28T00:00:00Z",
+    "active": true,
+    "quota": {
+      "max_uploads_per_month": 100,
+      "max_storage_mb": 1000
+    }
+  },
+  "string-e1dd": {
+    "tenant_id": "string-e1dd",
+    "name": "string",
+    "email": "user@example.com",
+    "api_key": "sk_string-e1dd_Pu0vwlS-M4Rbtj_StaiQPZDfgJOhYVDe",
+    "created_at": "2025-10-29T07:16:52.149568",
+    "active": true,
+    "quota": {
+      "max_uploads_per_month": 100,
+      "max_storage_mb": 1000
+    }
+  },
+  "string-a6b5": {
+    "tenant_id": "string-a6b5",
+    "name": "string",
+    "email": "user@example.com",
+    "api_key": "sk_string-a6b5__dKgYjUeHizQpW8rvIVJ7YTCpVgHB7_J",
+    "created_at": "2025-10-29T07:16:58.046605",
+    "active": true,
+    "quota": {
+      "max_uploads_per_month": 100,
+      "max_storage_mb": 1000
+    }
+  },
+  "string-e3f1": {
+    "tenant_id": "string-e3f1",
+    "name": "string",
+    "email": "user@example.com",
+    "api_key": "sk_string-e3f1_rfUG7-sFVOA0u6FCg-AIuP_Gqw06YPl0",
+    "created_at": "2025-10-29T07:17:00.236710",
+    "active": true,
+    "quota": {
+      "max_uploads_per_month": 100,
+      "max_storage_mb": 1000
+    }
+  },
+  "string-59cb": {
+    "tenant_id": "string-59cb",
+    "name": "string",
+    "email": "user@example.com",
+    "api_key": "sk_string-59cb_2fat1p1lDIguaDeRglKS8CESW7fYqu3x",
+    "created_at": "2025-10-29T07:17:01.987989",
+    "active": true,
+    "quota": {
+      "max_uploads_per_month": 100,
+      "max_storage_mb": 1000
+    }
+  },
+  "deep-ec08": {
+    "tenant_id": "deep-ec08",
+    "name": "Deep",
+    "email": "deep@gmail.com",
+    "api_key": "sk_deep-ec08_m7apS7AyD7rrPirv77B-IBGnSPck4BWI",
+    "created_at": "2025-11-09T10:12:31.557445",
+    "active": true,
+    "quota": {
+      "max_uploads_per_month": 100,
+      "max_storage_mb": 1000
+    }
+  }
+}

@@ -1,0 +1,99 @@
+{
+  "city-general": {
+    "total_uploads": 0,
+    "total_storage_mb": 0.0,
+    "total_api_calls": 1,
+    "total_reports_generated": 0,
+    "last_activity": "2025-10-28T07:46:09.824011",
+    "monthly_usage": {
+      "2025-10": {
+        "uploads": 0,
+        "storage_mb": 0.0,
+        "api_calls": 1,
+        "reports_generated": 0
+      }
+    }
+  },
+  "string-59cb": {
+    "total_uploads": 57,
+    "total_storage_mb": 174.76956367492676,
+    "total_api_calls": 67,
+    "total_reports_generated": 0,
+    "last_activity": "2025-11-05T01:38:00.861837",
+    "monthly_usage": {
+      "2025-10": {
+        "uploads": 1,
+        "storage_mb": 1.5534257888793945,
+        "api_calls": 5,
+        "reports_generated": 0
+      },
+      "2025-11": {
+        "uploads": 56,
+        "storage_mb": 173.21613788604736,
+        "api_calls": 62,
+        "reports_generated": 0
+      }
+    },
+    "endpoint_counters": {
+      "request": 65,
+      "list_reports": 1,
+      "get_report": 1
+    }
+  },
+  "string-e3f1": {
+    "total_uploads": 20,
+    "total_storage_mb": 91.82919597625732,
+    "total_api_calls": 38,
+    "total_reports_generated": 0,
+    "last_activity": "2025-11-04T05:45:36.856443",
+    "monthly_usage": {
+      "2025-11": {
+        "uploads": 20,
+        "storage_mb": 91.82919597625732,
+        "api_calls": 38,
+        "reports_generated": 0
+      }
+    },
+    "endpoint_counters": {
+      "request": 38
+    }
+  },
+  "deep-8188": {
+    "total_uploads": 22,
+    "total_storage_mb": 23.228511810302734,
+    "total_api_calls": 243,
+    "total_reports_generated": 0,
+    "last_activity": "2025-11-10T06:53:21.031793",
+    "monthly_usage": {
+      "2025-11": {
+        "uploads": 22,
+        "storage_mb": 23.228511810302734,
+        "api_calls": 243,
+        "reports_generated": 0
+      }
+    },
+    "endpoint_counters": {
+      "request": 142,
+      "list_reports": 3,
+      "get_report": 98
+    }
+  },
+  "devtestimg-fd14": {
+    "total_uploads": 0,
+    "total_storage_mb": 0.0,
+    "total_api_calls": 1,
+    "total_reports_generated": 0,
+    "last_activity": "2025-11-10T06:36:20.398815",
+    "monthly_usage": {
+      "2025-11": {
+        "uploads": 0,
+        "storage_mb": 0.0,
+        "api_calls": 1,
+        "reports_generated": 0
+      }
+    },
+    "endpoint_counters": {
+      "request": 1
+    }
+  }
+}
