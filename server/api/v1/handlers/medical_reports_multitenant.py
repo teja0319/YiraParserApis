@@ -72,7 +72,7 @@ class ReportStatus(BaseModel):
     parsed_data: Optional[dict] = None
 
 @router.post(
-    "aync/tenants/{tenant_id}/projects/{project_id}/reports",
+    "/tenants/{tenant_id}/projects/{project_id}/reports",
     summary="Upload medical report(s) for project",
     description="Upload one or more PDF medical reports for a specific project. Files are parsed using the project's assigned AI model.",
 )
