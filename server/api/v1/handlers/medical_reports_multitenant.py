@@ -4,7 +4,7 @@ Tenant-scoped medical report endpoints.
 
 from __future__ import annotations
 from fastapi import (
-    APIRouter, UploadFile, File, Depends, HTTPException, status, Query, BackgroundTasks
+    APIRouter, UploadFile, File, Depends, HTTPException, status, Query, BackgroundTasks, Request
 )
 import time
 import io
@@ -12,6 +12,7 @@ import logging
 import zipfile
 from typing import List, Optional
 import asyncio
+import httpx
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile, status
 from bson import ObjectId
@@ -79,7 +80,7 @@ async def upload_report(
     tenant_id: str,
     project_id: str,
     file: List[UploadFile] = File(..., description="PDF medical report(s) or ZIP file containing PDFs"),
-    waitForParsedResponse: bool = Query(True, description="Wait for parsing (synchronous) or queue and poll by reportId"),
+    webhook_url: Optional[str] = Query(None, description="Optional webhook URL to POST parsed report when ready (used when waitForParsedResponse=false)"),
     background_tasks: BackgroundTasks = None,
     auth: AuthenticatedTenant = Depends(resolve_tenant),
 ):
@@ -87,11 +88,19 @@ async def upload_report(
     projects_collection = db["projects"]
     ai_models_collection = db["ai_models"]
     parsed_reports_collection = db["parsed_reports"]
+    
 
     # Verify project
     project = await projects_collection.find_one({"project_id": project_id, "tenant_id": tenant_id})
     if not project:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Project '{project_id}' not found for tenant '{tenant_id}'")
+    if not project.get("is_active", True):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=f"Project '{project_id}' is not active.")
+
+    # Check tenant status (active)
+    tenant = await db["tenants"].find_one({"tenant_id": tenant_id})
+    if not tenant or not tenant.get("active", True):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=f"Tenant '{tenant_id}' is not active.")
 
     ai_model_id = project.get("ai_model_id")
     if not ai_model_id:
@@ -141,7 +150,7 @@ async def upload_report(
     report_id = str(report_object_id)
     usage_tracker.track_upload(tenant_id, total_size_mb)
 
-    async def do_parsing_and_save(update_record=False):
+    async def do_parsing_and_save(job_id,update_record=False):
         parse_start_time = time.time()
         consolidated_data = None
         parsed_results = []
@@ -163,10 +172,32 @@ async def upload_report(
                 except Exception as exc:
                     continue
             if not parsed_results:
+                failed_doc = {"status": "failed", "message": "Failed to parse any of the uploaded PDF files."}
                 await parsed_reports_collection.update_one(
                     {"report_id": report_id},
-                    {"$set": {"status": "failed", "message": "Failed to parse any of the uploaded PDF files."}}
+                    {"$set": failed_doc}
                 )
+                # send webhook failure if requested
+                if webhook_url:
+                    try:
+                        async with httpx.AsyncClient(timeout=10.0) as client:
+                            response = await client.post(webhook_url, json={
+                                "tenant_id": tenant_id,
+                                "project_id": project_id,
+                                "job_id": job_id,
+                                "status": "failed",
+                                "message": failed_doc["message"]
+                            })
+                            if response.status_code >= 200 and response.status_code < 300:
+                                logger.info("Webhook delivered successfully to %s (status: %d)", webhook_url, response.status_code)
+                                await parsed_reports_collection.update_one(
+                                    {"report_id": report_id},
+                                    {"$set": {"webhook_meta.delivered": True}}
+                                )
+                            else:
+                                logger.warning("Webhook delivery failed to %s (status: %d)", webhook_url, response.status_code)
+                    except Exception as e:
+                        logger.warning("Failed to POST failure webhook to %s: %s", webhook_url, e)
                 return
             consolidated_data = _merge_parsed_reports(parsed_results)
         parse_end_time = time.time()
@@ -200,604 +231,127 @@ async def upload_report(
         }
         if update_record:
             await parsed_reports_collection.update_one(
-                {"report_id": report_id},
-                {"$set": parsed_report_doc}
+                 {"_id": ObjectId(job_id)},
+                 {"$set": parsed_report_doc}
+            )
+            # Ensure webhook_meta is not lost after update
+            await parsed_reports_collection.update_one(
+                {"_id": ObjectId(job_id)},
+                {"$setOnInsert": {"webhook_meta": {
+                    "delivered": False,
+                    "status": "pending",
+                    "webhook_url": webhook_url
+                }}}
             )
         else:
             await parsed_reports_collection.insert_one(parsed_report_doc)
 
+        # send webhook on success if provided
+        if webhook_url:
+            try:
+                # fetch latest doc for completeness (or use parsed_report_doc)
+                try:
+                    latest_doc = await parsed_reports_collection.find_one({"_id": ObjectId(job_id)})
+                    parsed_data_only = latest_doc.get("parsed_data")
+                except Exception:
+                    latest_doc = parsed_report_doc
+                async with httpx.AsyncClient(timeout=10.0) as client:
+                    response = await client.post(webhook_url, json={
+                        "tenant_id": tenant_id,
+                        "project_id": project_id,
+                        "job_id": job_id,
+                        "status": parsed_report_doc.get("status", "completed"),
+                        "report": parsed_data_only
+                    })
+                    if response.status_code >= 200 and response.status_code < 300:
+                        logger.info("Webhook delivered successfully to %s (status: %d)", webhook_url, response.status_code)
+                        await parsed_reports_collection.update_one(
+                            {"_id": ObjectId(job_id)},
+                            {"$set": {"webhook_meta.delivered": True, "webhook_meta.status": "success", "webhook_meta.webhook_url": webhook_url}}
+                        )
+                    else:
+                        logger.warning("Webhook delivery failed to %s (status: %d)", webhook_url, response.status_code)
+                        await parsed_reports_collection.update_one(
+                            {"_id": ObjectId(job_id)},
+                            {"$set": {"webhook_meta.delivered": False, "webhook_meta.status": f"fail ({response.status_code})", "webhook_meta.webhook_url": webhook_url}}
+                        )
+            except Exception as e:
+                logger.warning("Failed to POST success webhook to %s: %s", webhook_url, e)
+                await parsed_reports_collection.update_one(
+                    {"_id": ObjectId(job_id)},
+                    {"$set": {"webhook_meta.delivered": False, "webhook_meta.status": f"fail ({str(e)[:100]})", "webhook_meta.webhook_url": webhook_url}}
+                )
 
     # For async: Immediately persist with status "pending", then queue parsing
-    if not waitForParsedResponse:
-        await parsed_reports_collection.insert_one({
-            "tenant_id": tenant_id,
-            "project_id": project_id,
-            "report_id": report_id,
+    result = await parsed_reports_collection.insert_one({
+        "tenant_id": tenant_id,
+        "project_id": project_id,
+        "report_id": report_id,
+        "status": "pending",
+        "message": "Parsing queued",
+        "created_at": time.time(),
+        "webhook_meta": { 
+            "delivered": False,
             "status": "pending",
-            "message": "Parsing queued",
-            "created_at": time.time(),
-        })
-        if background_tasks:
-            asyncio.create_task(do_parsing_and_save(update_record=True))
-        return {"success": True, "report_id": report_id, "status": "pending", "message": "Parsing queued"}
-
-    # For sync: Do parsing synchronously, then return data
-    await do_parsing_and_save(update_record=False)
-    doc = await parsed_reports_collection.find_one({"report_id": report_id})
-    return _serialize_mongodb_doc(doc) if doc else {"success": False, "report_id": report_id, "status": "failed", "message": "Parsing failed"}
+            "webhook_url": webhook_url
+        }
+    })
+    job_id = str(result.inserted_id)
+    asyncio.create_task(do_parsing_and_save(job_id, update_record=True))
+    return {"success": True, "job_id": job_id, "status": "pending", "message": "Parsing queued", "callback_url": webhook_url}
 
 
 
-@router.post(
-    "/tenants/{tenant_id}/projects/{project_id}/reports",
-    summary="Upload medical report(s) for project",
-    description="Upload one or more PDF medical reports for a specific project. Files are parsed using the project's assigned AI model.",
+@router.get(
+    "/job/status/{Job_id}",
+    summary="Get report processing status (Job Status)",
+    description="Fetch the current status of a report being processed asynchronously. Use report_id as the job ID.",
 )
-async def upload_report(
-    tenant_id: str,
-    project_id: str,
-    file: List[UploadFile] = File(..., description="PDF medical report(s) or ZIP file containing PDFs"),
+async def get_report_status(
+    Job_id: str,
     auth: AuthenticatedTenant = Depends(resolve_tenant),
 ):
     """
-    Upload PDF report(s) for a project and kick off parsing.
+    Get the processing status of a report by report_id (job_id).
     
-    Updated to use projectId instead of model parameter.
-    Retrieves AI model from project configuration.
-    
-    Supports:
-    - Single PDF file
-    - Multiple PDF files (consolidated into one report)
-    - ZIP file containing PDFs (auto-extracted and consolidated)
-    - Mix of PDFs and ZIP files
+    Returns:
+    - status: "pending", "completed", or "failed"
+    - message: Human-readable status message
+    - parsing_time_seconds: Time taken to parse (if completed)
+    - confidence_score: Confidence of parsed data (if completed)
+    - files_processed: Number of files processed
+    - webhook_delivered: Whether webhook was successfully delivered (if applicable)
     """
-    try:
-        db = await MongoDBClient.get_database()
-        projects_collection = db["projects"]
-        ai_models_collection = db["ai_models"]
-        parsed_reports_collection = db["parsed_reports"]  # <-- Add this line
-
-        # Verify project exists and belongs to tenant
-        project = await projects_collection.find_one({
-            "project_id": project_id,
-            "tenant_id": tenant_id
-        })
-        
-        if not project:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail=f"Project '{project_id}' not found for tenant '{tenant_id}'",
-            )
-        
-        ai_model_id = project.get("ai_model_id")
-        if not ai_model_id:
-            raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                detail=f"Project '{project_id}' has no assigned AI model",
-            )
-        
-        ai_model = await ai_models_collection.find_one({
-            "model_id": ai_model_id,
-            "tenant_id": tenant_id
-        })
-        
-        if not ai_model:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail=f"AI model '{ai_model_id}' not found",
-            )
-        
-        # Use AI model's provider to determine which model to use
-        settings = get_settings()
-        selected_model = settings.gemini_model  # Default to settings
-        
-        logger.info(f"Processing report for project '{project_id}' using AI model '{ai_model_id}' with Gemini model '{selected_model}'")
-        
-        # Create Gemini client with selected model
-        gemini_client = GeminiParser(
-            api_key=settings.gemini_api_key,
-            model=selected_model,
-        )
-
-        storage_client = _get_storage_client()
-        
-        try:
-            # Collect all PDF files (from direct uploads and ZIP extraction)
-            pdf_files = []
-            total_size_mb = 0.0
-            
-            for uploaded_file in file:
-                file_bytes = await uploaded_file.read()
-                file_size_mb = len(file_bytes) / (1024 * 1024)
-                total_size_mb += file_size_mb
-                
-                # Check if this is a ZIP file
-                is_zip = (
-                    uploaded_file.filename and uploaded_file.filename.lower().endswith('.zip')
-                ) or (
-                    uploaded_file.content_type and 'zip' in uploaded_file.content_type.lower()
-                )
-                
-                if is_zip:
-                    logger.info("Extracting ZIP file '%s' for tenant '%s'", uploaded_file.filename, tenant_id)
-                    try:
-                        with zipfile.ZipFile(io.BytesIO(file_bytes)) as zip_ref:
-                            for zip_info in zip_ref.namelist():
-                                # Skip macOS metadata files and directories
-                                if '__MACOSX' in zip_info or zip_info.endswith('/'):
-                                    continue
-                                
-                                # Only process PDF files
-                                if zip_info.lower().endswith('.pdf'):
-                                    pdf_bytes = zip_ref.read(zip_info)
-                                    pdf_size_mb = len(pdf_bytes) / (1024 * 1024)
-                                    pdf_files.append({
-                                        'filename': zip_info,
-                                        'bytes': pdf_bytes,
-                                        'size_mb': pdf_size_mb,
-                                    })
-                                    logger.info("Extracted PDF '%s' (%.2f MB) from ZIP", zip_info, pdf_size_mb)
-                    except zipfile.BadZipFile:
-                        raise HTTPException(
-                            status_code=status.HTTP_400_BAD_REQUEST,
-                            detail=f"File '{uploaded_file.filename}' is not a valid ZIP file.",
-                        )
-                else:
-                    # Regular PDF file
-                    if uploaded_file.content_type and uploaded_file.content_type.lower() != "application/pdf":
-                        raise HTTPException(
-                            status_code=status.HTTP_400_BAD_REQUEST,
-                            detail=f"Only PDF and ZIP files are supported. Got: {uploaded_file.content_type}",
-                        )
-                    pdf_files.append({
-                        'filename': uploaded_file.filename or 'document.pdf',
-                        'bytes': file_bytes,
-                        'size_mb': file_size_mb,
-                    })
-            
-            if not pdf_files:
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail="No PDF files found in the uploaded file(s).",
-                )
-            
-            # Log all received files
-            logger.info("=" * 60)
-            logger.info("FILES RECEIVED FOR PROJECT '%s' IN TENANT '%s':", project_id, tenant_id)
-            for idx, pdf_file in enumerate(pdf_files, 1):
-                logger.info("  [%d] %s (%.2f MB)", idx, pdf_file['filename'], pdf_file['size_mb'])
-            logger.info("=" * 60)
-            
-            logger.info("Processing %d PDF file(s) for project '%s'", len(pdf_files), project_id)
-            
-            # Start timing
-            parse_start_time = time.time()
-            
-            # For multiple PDFs, parse them together to enable accurate cross-document photo comparison
-            consolidated_data = None
-            parsed_results = []
-            
-            if len(pdf_files) > 1:
-                logger.info("Parsing %d PDFs together for accurate cross-document photo comparison", len(pdf_files))
-                try:
-                    consolidated_data = gemini_client.parse_multiple_pdfs(pdf_files)
-                    if consolidated_data:
-                        logger.info("Successfully parsed %d PDFs together", len(pdf_files))
-                        parsed_results = [{'filename': pdf['filename'], 'data': consolidated_data} for pdf in pdf_files]
-                except Exception as exc:
-                    logger.error("Batch parsing failed: %s. Falling back to individual parsing.", exc)
-                    consolidated_data = None
-            
-            # Fallback: Parse each PDF individually if batch failed or single file
-            if not consolidated_data:
-                parsed_results = []
-                for pdf_file in pdf_files:
-                    logger.info("Parsing PDF '%s' for project '%s'", pdf_file['filename'], project_id)
-                    try:
-                        parsed_data = gemini_client.parse_pdf(pdf_file['bytes'], pdf_file['filename'])
-                        if parsed_data:
-                            parsed_results.append({
-                                'filename': pdf_file['filename'],
-                                'data': parsed_data,
-                            })
-                    except Exception as exc:
-                        logger.warning("Failed to parse PDF '%s': %s", pdf_file['filename'], exc)
-                        continue
-                
-                if not parsed_results:
-                    raise HTTPException(
-                        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                        detail="Failed to parse any of the uploaded PDF files.",
-                    )
-                
-                # Consolidate all parsed data into a single report
-                consolidated_data = _merge_parsed_reports(parsed_results)
-            
-            # Calculate parsing time
-            parse_end_time = time.time()
-            parsing_time_seconds = round(parse_end_time - parse_start_time, 2)
-            logger.info("⏱️  PARSING TIME: %.2f seconds using model '%s'", parsing_time_seconds, selected_model)
-            
-            # Try to store the consolidated report (optional - continue even if storage fails)
-            report_id = None
-            storage_error = None
-            first_file = file[0]
-            blob_url = None
-
-            try:
-                await first_file.seek(0)
-                # Ensure we have a report_id for a stable blob name
-                if not report_id:
-                    # Create a concise unique id for the blob name
-                    report_object_id = ObjectId()
-                    report_id = str(report_object_id)
-
-                # Include UTC timestamp in blob name to avoid collisions and aid debugging
-                from datetime import datetime
-                timestamp = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
-                azure_blob_name = f"{tenant_id}/{report_id}_{timestamp}.pdf"
-
-                blob_url = await storage_client.upload_pdf_and_get_url(
-                    tenant_id=tenant_id,
-                    blob_name=azure_blob_name,
-                    file=first_file,
-                )
-            except Exception as storage_exc:
-                storage_error = str(storage_exc)
-                logger.warning("Failed to store report in Azure (continuing anyway): %s", storage_exc)
-                blob_url = None
-
-            usage_tracker.track_upload(tenant_id, total_size_mb)
-
-            # Split confidence information from the parsed payload
-            clean_parsed_data = consolidated_data.copy() if isinstance(consolidated_data, dict) else {}
-            gemini_confidence = None
-            gemini_confidence_summary = None
-            if clean_parsed_data:
-                gemini_confidence = clean_parsed_data.pop("confidence_score", None)
-                gemini_confidence_summary = clean_parsed_data.pop("confidence_summary", None)
-            
-            # Calculate REAL confidence score based on data quality validation
-            logger.info("🔍 Calculating validated confidence score...")
-            validated_confidence, validated_summary, validation_details = calculate_confidence(
-                parsed_data=clean_parsed_data or consolidated_data,
-                gemini_confidence=gemini_confidence
-            )
-            logger.info("✅ Validated Confidence: %d/100 - %s", validated_confidence, validated_summary)
-
-            # response_data = {
-            #     "success": True,
-            #     "tenant_id": tenant_id,
-            #     "project_id": project_id,
-            #     "report_id": report_id,
-            #     "ai_model_id": ai_model_id,
-            #     "model_used": selected_model,
-            #     "parsing_time_seconds": parsing_time_seconds,
-            #     "confidence_score": validated_confidence,
-            #     "confidence_summary": validated_summary,
-            #     "total_size_mb": round(total_size_mb, 2),
-            #     "files_processed": len(pdf_files),
-            #     "successful_parses": len(parsed_results),
-            #     "failed_parses": len(pdf_files) - len(parsed_results),
-            #     "parsed_data": clean_parsed_data or consolidated_data,
-            #     "message": f"Successfully processed {len(parsed_results)} of {len(pdf_files)} PDF file(s) in {parsing_time_seconds}s.",
-            # }
-            
-            # if storage_error:
-            #     response_data["storage_warning"] = (
-            #         "Note: Azure Blob Storage is not available. Report parsed successfully but not persisted. "
-            #         f"Error: {storage_error[:100]}"
-            #     )
-            
-            # Store parsed data and blob URL in MongoDB
-            try:
-                # Generate unique report_id if not already set (we may have created it before upload)
-                if not report_id:
-                    report_object_id = ObjectId()
-                    report_id = str(report_object_id)
-
-                parsed_report_doc = {
-                    "tenant_id": tenant_id,
-                    "project_id": project_id,
-                    "report_id": report_id,  # <-- always unique ObjectId string
-                    "blob_url": blob_url,
-                    "parsing_time_seconds": parsing_time_seconds,
-                    "confidence_score": validated_confidence,
-                    "confidence_summary": validated_summary,
-                    "total_size_mb": round(total_size_mb, 2),
-                    "files_processed": len(pdf_files),
-                    "successful_parses": len(parsed_results),
-                    "failed_parses": len(pdf_files) - len(parsed_results),
-                    "parsed_data": clean_parsed_data or consolidated_data,
-                    "created_at": time.time(),
-                }
-                result = await parsed_reports_collection.insert_one(parsed_report_doc)
-                parsed_report_doc["_id"] = str(result.inserted_id)
-                logger.info("Parsed report stored in DB for report_id: %s", report_id)
-            except Exception as db_exc:
-                logger.warning("Failed to store parsed report in DB: %s", db_exc)
-
-            return parsed_report_doc
-        except HTTPException:
-            raise
-        except Exception as exc:
-            logger.exception("Failed to upload report for project %s: %s", project_id, exc)
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="Failed to process report. Please retry or contact support.",
-            ) from exc
-    except HTTPException:
-        raise
-    except Exception as exc:
-        logger.exception("Failed to process upload request: %s", exc)
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to process report. Please retry or contact support.",
-        ) from exc
-
-
-@router.post(
-    "/tenants/{tenant_id}/reports",
-    summary="Upload medical report(s) for tenant",
-    description="Upload one or more PDF medical reports, or a ZIP file containing PDFs. All files will be consolidated into a single report.",
-)
-async def upload_report_legacy(
-    tenant_id: str,
-    file: List[UploadFile] = File(..., description="PDF medical report(s) or ZIP file containing PDFs"),
-    model: Optional[str] = Query(
-        None, 
-        description="Gemini model to use: 'gemini-2.5-pro' (accurate, slower) or 'gemini-2.5-flash' (fast, efficient). Defaults to settings.",
-        regex="^(gemini-2\\.5-pro|gemini-2\\.5-flash)$"
-    ),
-    auth: AuthenticatedTenant = Depends(resolve_tenant),
-):
-    """
-    Upload PDF report(s) for the tenant and kick off parsing.
-    Supports:
-    - Single PDF file
-    - Multiple PDF files (consolidated into one report)
-    - ZIP file containing PDFs (auto-extracted and consolidated)
-    - Mix of PDFs and ZIP files
-    """
-    tenant = tenant_manager.get_tenant(tenant_id)
-    if not tenant:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Tenant '{tenant_id}' not found.",
-        )
-
-    storage_client = _get_storage_client()
     db = await MongoDBClient.get_database()
-    parsed_reports_collection = db["parsed_reports"]  # <-- Add this line
-    
-    # Use specified model or fallback to settings default
-    settings = get_settings()
-    selected_model = model or settings.gemini_model
-    logger.info("Using Gemini model: %s (requested: %s, default: %s)", 
-                selected_model, model, settings.gemini_model)
-    
-    # Create Gemini client with selected model
-    gemini_client = GeminiParser(
-        api_key=settings.gemini_api_key,
-        model=selected_model,
-    )
+    parsed_reports_collection = db["parsed_reports"]
 
     try:
-        # Collect all PDF files (from direct uploads and ZIP extraction)
-        pdf_files = []
-        total_size_mb = 0.0
-        
-        for uploaded_file in file:
-            file_bytes = await uploaded_file.read()
-            file_size_mb = len(file_bytes) / (1024 * 1024)
-            total_size_mb += file_size_mb
-            
-            # Check if this is a ZIP file
-            is_zip = (
-                uploaded_file.filename and uploaded_file.filename.lower().endswith('.zip')
-            ) or (
-                uploaded_file.content_type and 'zip' in uploaded_file.content_type.lower()
-            )
-            
-            if is_zip:
-                logger.info("Extracting ZIP file '%s' for tenant '%s'", uploaded_file.filename, tenant_id)
-                try:
-                    with zipfile.ZipFile(io.BytesIO(file_bytes)) as zip_ref:
-                        for zip_info in zip_ref.namelist():
-                            # Skip macOS metadata files and directories
-                            if '__MACOSX' in zip_info or zip_info.endswith('/'):
-                                continue
-                            
-                            # Only process PDF files
-                            if zip_info.lower().endswith('.pdf'):
-                                pdf_bytes = zip_ref.read(zip_info)
-                                pdf_size_mb = len(pdf_bytes) / (1024 * 1024)
-                                pdf_files.append({
-                                    'filename': zip_info,
-                                    'bytes': pdf_bytes,
-                                    'size_mb': pdf_size_mb,
-                                })
-                                logger.info("Extracted PDF '%s' (%.2f MB) from ZIP", zip_info, pdf_size_mb)
-                except zipfile.BadZipFile:
-                    raise HTTPException(
-                        status_code=status.HTTP_400_BAD_REQUEST,
-                        detail=f"File '{uploaded_file.filename}' is not a valid ZIP file.",
-                    )
-            else:
-                # Regular PDF file
-                if uploaded_file.content_type and uploaded_file.content_type.lower() != "application/pdf":
-                    raise HTTPException(
-                        status_code=status.HTTP_400_BAD_REQUEST,
-                        detail=f"Only PDF and ZIP files are supported. Got: {uploaded_file.content_type}",
-                    )
-                pdf_files.append({
-                    'filename': uploaded_file.filename or 'document.pdf',
-                    'bytes': file_bytes,
-                    'size_mb': file_size_mb,
-                })
-        
-        if not pdf_files:
+        report = await parsed_reports_collection.find_one({"_id": ObjectId(Job_id)})
+
+        if not report:
             raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="No PDF files found in the uploaded file(s).",
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Job '{Job_id}' not found or access denied.",
             )
-        
-        # Log all received files
-        logger.info("=" * 60)
-        logger.info("FILES RECEIVED FOR TENANT '%s':", tenant_id)
-        for idx, pdf_file in enumerate(pdf_files, 1):
-            logger.info("  [%d] %s (%.2f MB)", idx, pdf_file['filename'], pdf_file['size_mb'])
-        logger.info("=" * 60)
-        
-        logger.info("Processing %d PDF file(s) for tenant '%s'", len(pdf_files), tenant_id)
-        
-        # Start timing
-        import time
-        parse_start_time = time.time()
-        
-        # For multiple PDFs, parse them together to enable accurate cross-document photo comparison
-        consolidated_data = None
-        parsed_results = []  # Initialize to track parsing results
-        
-        if len(pdf_files) > 1:
-            logger.info("Parsing %d PDFs together for accurate cross-document photo comparison", len(pdf_files))
-            try:
-                consolidated_data = gemini_client.parse_multiple_pdfs(pdf_files)
-                if consolidated_data:
-                    logger.info("Successfully parsed %d PDFs together", len(pdf_files))
-                    # Mark all as successfully parsed for batch mode
-                    parsed_results = [{'filename': pdf['filename'], 'data': consolidated_data} for pdf in pdf_files]
-            except Exception as exc:
-                logger.error("Batch parsing failed: %s. Falling back to individual parsing.", exc)
-                consolidated_data = None
-        
-        # Fallback: Parse each PDF individually if batch failed or single file
-        if not consolidated_data:
-            parsed_results = []
-            for pdf_file in pdf_files:
-                logger.info("Parsing PDF '%s' for tenant '%s'", pdf_file['filename'], tenant_id)
-                try:
-                    parsed_data = gemini_client.parse_pdf(pdf_file['bytes'], pdf_file['filename'])
-                    if parsed_data:
-                        parsed_results.append({
-                            'filename': pdf_file['filename'],
-                            'data': parsed_data,
-                        })
-                except Exception as exc:
-                    logger.warning("Failed to parse PDF '%s': %s", pdf_file['filename'], exc)
-                    continue
-            
-            if not parsed_results:
-                raise HTTPException(
-                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                    detail="Failed to parse any of the uploaded PDF files.",
-                )
-            
-            # Consolidate all parsed data into a single report
-            consolidated_data = _merge_parsed_reports(parsed_results)
-        
-        # Calculate parsing time
-        parse_end_time = time.time()
-        parsing_time_seconds = round(parse_end_time - parse_start_time, 2)
-        logger.info("⏱️  PARSING TIME: %.2f seconds using model '%s'", parsing_time_seconds, selected_model)
-        
-        # Try to store the consolidated report (optional - continue even if storage fails)
-        report_id = None
-        storage_error = None
-        first_file = file[0]
-        blob_url = None
 
-        try:
-            await first_file.seek(0)
-            # Ensure we have a report_id for a stable blob name
-            if not report_id:
-                # Create a concise unique id for the blob name
-                report_object_id = ObjectId()
-                report_id = str(report_object_id)
+        # Build status response
+        status_response = {
+            "job_id": Job_id,
+            "Parsing status": report.get("status", "unknown"),
+            "message": report.get("message", ""),
+            "created_at": report.get("created_at"),
+            "weebhook_meta": report.get("webhook_meta", None),
+        }
 
-            # Include UTC timestamp in blob name to avoid collisions and aid debugging
-            from datetime import datetime
-            timestamp = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
-            azure_blob_name = f"{tenant_id}/{report_id}_{timestamp}.pdf"
+        return status_response
 
-            blob_url = await storage_client.upload_pdf_and_get_url(
-                tenant_id=tenant_id,
-                blob_name=azure_blob_name,
-                file=first_file,
-            )
-        except Exception as storage_exc:
-            storage_error = str(storage_exc)
-            logger.warning("Failed to store report in Azure (continuing anyway): %s", storage_exc)
-            blob_url = None
-
-        usage_tracker.track_upload(tenant_id, total_size_mb)
-
-        # Split confidence information from the parsed payload so we can surface it cleanly
-        clean_parsed_data = consolidated_data.copy() if isinstance(consolidated_data, dict) else {}
-        gemini_confidence = None
-        gemini_confidence_summary = None
-        if clean_parsed_data:
-            gemini_confidence = clean_parsed_data.pop("confidence_score", None)
-            gemini_confidence_summary = clean_parsed_data.pop("confidence_summary", None)
-        
-        # Calculate REAL confidence score based on data quality validation
-        logger.info("🔍 Calculating validated confidence score...")
-        validated_confidence, validated_summary, validation_details = calculate_confidence(
-            parsed_data=clean_parsed_data or consolidated_data,
-            gemini_confidence=gemini_confidence
-        )
-        logger.info("✅ Validated Confidence: %d/100 - %s", validated_confidence, validated_summary)
-        logger.info("   Gemini Self-Assessment: %s", gemini_confidence or "N/A")
-
-        # response_data = {
-        #     "success": True,
-        #     "parsing_time_seconds": parsing_time_seconds,
-        #     "confidence_score": validated_confidence,
-        #     "confidence_summary": validated_summary,
-        #     "total_size_mb": round(total_size_mb, 2),
-        #     "files_processed": len(pdf_files),
-        #     "successful_parses": len(parsed_results),
-        #     "failed_parses": len(pdf_files) - len(parsed_results),
-        #     "parsed_data": clean_parsed_data or consolidated_data,
-        #     "message": f"Successfully processed {len(parsed_results)} of {len(pdf_files)} PDF file(s) in {parsing_time_seconds}s using {selected_model}.",
-        # }
-        
-        # Store parsed data and blob URL in MongoDB
-        try:
-            # Generate unique report_id if not already set (we may have created it before upload)
-            if not report_id:
-                report_object_id = ObjectId()
-                report_id = str(report_object_id)
-
-            parsed_report_doc = {
-                "tenant_id": tenant_id,
-                "project_id": None,
-                "report_id": report_id,  # <-- always unique ObjectId string
-                "blob_url": blob_url,
-                "parsing_time_seconds": parsing_time_seconds,
-                "confidence_score": validated_confidence,
-                "confidence_summary": validated_summary,
-                "total_size_mb": round(total_size_mb, 2),
-                "files_processed": len(pdf_files),
-                "successful_parses": len(parsed_results),
-                "failed_parses": len(pdf_files) - len(parsed_results),
-                "parsed_data": clean_parsed_data or consolidated_data,
-                "created_at": time.time(),
-            }
-            result = await parsed_reports_collection.insert_one(parsed_report_doc)
-            parsed_report_doc["_id"] = str(result.inserted_id)
-            logger.info("Parsed report stored in DB for report_id: %s", report_id)
-        except Exception as db_exc:
-            logger.warning("Failed to store parsed report in DB: %s", db_exc)
-
-        return parsed_report_doc
     except HTTPException:
         raise
     except Exception as exc:
-        logger.exception("Failed to upload report for tenant %s: %s", tenant_id, exc)
+        logger.exception("Failed to fetch report status '%s' for tenant %s: %s", Job_id, exc)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to process report. Please retry or contact support.",
+            detail="Unable to fetch report status at this time.",
         ) from exc
 
 
@@ -1189,3 +743,57 @@ def _serialize_mongodb_doc(doc: dict) -> dict:
         else:
             result[key] = value
     return result
+
+@router.post(
+    "/webhook/test",
+    summary="Test webhook receiver",
+    description="Receive webhook POSTs for testing — logs headers, URL, and payload and returns a simple acknowledgement.",
+)
+async def webhook_test(request: Request):
+    """
+    Simple webhook endpoint for testing incoming payloads.
+    Logs URL, headers, and payload (attempts JSON decode, falls back to text/bytes).
+    """
+    try:
+        # Capture request metadata
+        url = str(request.url)
+        headers = dict(request.headers)
+        content_type = headers.get("content-type", "")
+        payload = None
+
+        # Attempt to parse the body
+        if "application/json" in content_type:
+            try:
+                payload = await request.json()
+            except Exception:
+                # fall back to raw body if JSON decode fails
+                raw = await request.body()
+                try:
+                    payload = raw.decode("utf-8", errors="replace")
+                except Exception:
+                    payload = raw
+        else:
+            raw = await request.body()
+            try:
+                payload = raw.decode("utf-8", errors="replace")
+            except Exception:
+                payload = raw
+
+        # ✅ Log full details
+        logger.info("WEBHOOK TEST RECEIVED — URL: %s", url)
+        logger.info("WEBHOOK TEST RECEIVED — Headers: %s", headers)
+        logger.info("WEBHOOK TEST RECEIVED — Payload: %s", payload)
+
+        return {
+            "success": True,
+            "received": True,
+            "note": "Logged URL, headers, and payload on server",
+            "url": url
+        }
+
+    except Exception as exc:
+        logger.exception("Error handling webhook test: %s", exc)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Webhook handler error"
+        )

@@ -45,7 +45,7 @@ class AssignAIModelRequest(BaseModel):
 class ProjectResponse(BaseModel):
     """Response model for project operations"""
     success: bool
-    data: Optional[Project] = None
+    data: Optional[object] = None
     message: Optional[str] = None
 
 
@@ -62,19 +62,6 @@ async def create_project(
     try:
         db = await MongoDBClient.get_database()
         projects_collection = db["projects"]
-        ai_models_collection = db["ai_models"]
-        
-        # Verify AI model exists and belongs to this tenant
-        # ai_model = await ai_models_collection.find_one({
-        #     "model_id": request.ai_model_id,
-        #     "tenant_id": tenant_id
-        # })
-        
-        # if not ai_model:
-        #     raise HTTPException(
-        #         status_code=status.HTTP_404_NOT_FOUND,
-        #         detail=f"AI model '{request.ai_model_id}' not found for this tenant",
-        #     )
         
         project_id = str(uuid4())
         project = Project(
@@ -82,22 +69,25 @@ async def create_project(
             tenant_id=tenant_id,
             project_name=request.project_name,
             description=request.description,
-            # ai_model_id=request.ai_model_id,
         )
         
         # Insert into MongoDB
         project_dict = project.dict()
         await projects_collection.insert_one(project_dict)
         
-        # Remove MongoDB _id and ai_model_id from response
-        project_dict.pop('_id', None)
-        project_dict.pop('ai_model_id', None)
+        # Only include the required fields in the response
+        response_data = {
+            "project_id": project_id,
+            "tenant_id": tenant_id,
+            "project_name": request.project_name,
+            "description": request.description,
+        }
         
         logger.info(f"Created project '{project_id}' for tenant '{tenant_id}'")
         
         return ProjectResponse(
             success=True,
-            data=project_dict,
+            data=response_data,
             message=f"Project created successfully with ID: {project_id}"
         )
         
@@ -114,7 +104,6 @@ async def create_project(
 @router.get("/tenants/{tenant_id}/projects")
 async def list_projects(
     tenant_id: str,
-    active_only: bool = Query(False, description="Filter to active projects only"),
     auth: AuthenticatedTenant = Depends(resolve_tenant),
 ):
     """
@@ -125,8 +114,6 @@ async def list_projects(
         projects_collection = db["projects"]
         
         query = {"tenant_id": tenant_id}
-        if active_only:
-            query["is_active"] = True
         
         cursor = projects_collection.find(query)
         projects = []
