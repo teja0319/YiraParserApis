@@ -292,9 +292,9 @@ async def get_report_status(
             "report_id": job.get("report_id"),
             "status": job.get("status", "unknown"),
             "message": job.get("message", ""),
-            "created_at": job.get("created_at"),
-            "started_at": job.get("started_at"),
-            "completed_at": job.get("completed_at"),
+            # "created_at": job.get("created_at"),
+            # "started_at": job.get("started_at"),
+            # "completed_at": job.get("completed_at"),
         }
 
         # Add parsing details if available
