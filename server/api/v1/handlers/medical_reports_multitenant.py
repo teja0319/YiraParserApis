@@ -74,57 +74,70 @@ class ReportStatus(BaseModel):
 @router.post(
     "/tenants/{tenant_id}/projects/{project_id}/reports",
     summary="Upload medical report(s) for project",
-    description="Upload one or more PDF medical reports for a specific project. Files are parsed using the project's assigned AI model.",
+    description="Upload one or more PDF medical reports for a specific project. Returns immediately with job_id. Files are parsed asynchronously using the project's assigned AI model.",
 )
 async def upload_report(
     tenant_id: str,
     project_id: str,
     file: List[UploadFile] = File(..., description="PDF medical report(s) or ZIP file containing PDFs"),
-    webhook_url: Optional[str] = Query(None, description="Optional webhook URL to POST parsed report when ready (used when waitForParsedResponse=false)"),
+    webhook_url: Optional[str] = Query(None, description="Optional webhook URL to POST parsed report when ready"),
     background_tasks: BackgroundTasks = None,
     auth: AuthenticatedTenant = Depends(resolve_tenant),
 ):
     db = await MongoDBClient.get_database()
     projects_collection = db["projects"]
     ai_models_collection = db["ai_models"]
-    parsed_reports_collection = db["parsed_reports"]
-    
+    jobs_collection = db["parsing_jobs"]
 
-    # Verify project
+    # Verify project exists and is active
     project = await projects_collection.find_one({"project_id": project_id, "tenant_id": tenant_id})
     if not project:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Project '{project_id}' not found for tenant '{tenant_id}'")
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Project '{project_id}' not found for tenant '{tenant_id}'"
+        )
     if not project.get("is_active", True):
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=f"Project '{project_id}' is not active.")
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=f"Project '{project_id}' is not active."
+        )
 
-    # Check tenant status (active)
+    # Verify tenant is active
     tenant = await db["tenants"].find_one({"tenant_id": tenant_id})
     if not tenant or not tenant.get("active", True):
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=f"Tenant '{tenant_id}' is not active.")
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=f"Tenant '{tenant_id}' is not active."
+        )
 
+    # Verify AI model is configured and available
     ai_model_id = project.get("ai_model_id")
     if not ai_model_id:
-        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=f"Project '{project_id}' has not activeted please contact contact@yira.ai")
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"Project '{project_id}' has no AI model assigned. Please contact contact@yira.ai"
+        )
 
     ai_model = await ai_models_collection.find_one({"model_id": ai_model_id, "tenant_id": tenant_id})
     if not ai_model:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"AI model '{ai_model_id}' not found")
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"AI model '{ai_model_id}' not found"
+        )
 
-    settings = get_settings()
-    selected_model = ai_model.get("model_name")
-    print("Using Gemini model:", selected_model)
-    gemini_client = GeminiParser(api_key=settings.gemini_api_key, model=selected_model)
-
-    # File handling (same as before)
-    pdf_files = []
+    # Process uploaded files: extract PDFs from ZIP if needed
+    pdf_files_info = []
     total_size_mb = 0.0
+    
     for uploaded_file in file:
         file_bytes = await uploaded_file.read()
         file_size_mb = len(file_bytes) / (1024 * 1024)
         total_size_mb += file_size_mb
+        
         is_zip = (uploaded_file.filename and uploaded_file.filename.lower().endswith('.zip')) or (
             uploaded_file.content_type and 'zip' in uploaded_file.content_type.lower()
         )
+        
         if is_zip:
             try:
                 with zipfile.ZipFile(io.BytesIO(file_bytes)) as zip_ref:
@@ -133,189 +146,128 @@ async def upload_report(
                             continue
                         if zip_info.lower().endswith('.pdf'):
                             pdf_bytes = zip_ref.read(zip_info)
-                            pdf_size_mb = len(pdf_bytes) / (1024 * 1024)
-                            pdf_files.append({'filename': zip_info, 'bytes': pdf_bytes, 'size_mb': pdf_size_mb})
+                            pdf_files_info.append({
+                                'filename': zip_info,
+                                'bytes': pdf_bytes,
+                                'size_mb': len(pdf_bytes) / (1024 * 1024)
+                            })
             except zipfile.BadZipFile:
-                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"File '{uploaded_file.filename}' is not a valid ZIP file.")
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"File '{uploaded_file.filename}' is not a valid ZIP file."
+                )
         else:
             if uploaded_file.content_type and uploaded_file.content_type.lower() != "application/pdf":
-                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Only PDF and ZIP files are supported. Got: {uploaded_file.content_type}")
-            pdf_files.append({'filename': uploaded_file.filename or 'document.pdf', 'bytes': file_bytes, 'size_mb': file_size_mb})
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Only PDF and ZIP files are supported. Got: {uploaded_file.content_type}"
+                )
+            pdf_files_info.append({
+                'filename': uploaded_file.filename or 'document.pdf',
+                'bytes': file_bytes,
+                'size_mb': file_size_mb
+            })
 
-    if not pdf_files:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No PDF files found in the uploaded file(s).")
+    if not pdf_files_info:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="No PDF files found in the uploaded file(s)."
+        )
 
-    # Generate unique reportId
-    report_object_id = ObjectId()
-    report_id = str(report_object_id)
+    # Track usage
     usage_tracker.track_upload(tenant_id, total_size_mb)
 
-    async def do_parsing_and_save(job_id,update_record=False):
-        parse_start_time = time.time()
-        consolidated_data = None
-        parsed_results = []
-        # Parse files (same as before)
-        if len(pdf_files) > 1:
-            try:
-                consolidated_data = gemini_client.parse_multiple_pdfs(pdf_files)
-                if consolidated_data:
-                    parsed_results = [{'filename': pdf['filename'], 'data': consolidated_data} for pdf in pdf_files]
-            except Exception as exc:
-                consolidated_data = None
-        if not consolidated_data:
-            parsed_results = []
-            for pdf_file in pdf_files:
-                try:
-                    parsed_data = gemini_client.parse_pdf(pdf_file['bytes'], pdf_file['filename'])
-                    if parsed_data:
-                        parsed_results.append({'filename': pdf_file['filename'], 'data': parsed_data})
-                except Exception as exc:
-                    continue
-            if not parsed_results:
-                failed_doc = {"status": "failed", "message": "Failed to parse any of the uploaded PDF files."}
-                await parsed_reports_collection.update_one(
-                    {"report_id": report_id},
-                    {"$set": failed_doc}
-                )
-                # send webhook failure if requested
-                if webhook_url:
-                    try:
-                        async with httpx.AsyncClient(timeout=10.0) as client:
-                            response = await client.post(webhook_url, json={
-                                "tenant_id": tenant_id,
-                                "project_id": project_id,
-                                "job_id": job_id,
-                                "status": "failed",
-                                "message": failed_doc["message"]
-                            })
-                            if response.status_code >= 200 and response.status_code < 300:
-                                logger.info("Webhook delivered successfully to %s (status: %d)", webhook_url, response.status_code)
-                                await parsed_reports_collection.update_one(
-                                    {"report_id": report_id},
-                                    {"$set": {"webhook_meta.delivered": True}}
-                                )
-                            else:
-                                logger.warning("Webhook delivery failed to %s (status: %d)", webhook_url, response.status_code)
-                    except Exception as e:
-                        logger.warning("Failed to POST failure webhook to %s: %s", webhook_url, e)
-                return
-            consolidated_data = _merge_parsed_reports(parsed_results)
-        parse_end_time = time.time()
-        parsing_time_seconds = round(parse_end_time - parse_start_time, 2)
-        first_file = file[0]
-        blob_url = None
-
-        clean_parsed_data = consolidated_data.copy() if isinstance(consolidated_data, dict) else {}
-        gemini_confidence = clean_parsed_data.pop("confidence_score", None)
-        gemini_confidence_summary = clean_parsed_data.pop("confidence_summary", None)
-        validated_confidence, validated_summary, validation_details = calculate_confidence(
-            parsed_data=clean_parsed_data or consolidated_data,
-            gemini_confidence=gemini_confidence
+    # Upload files to blob storage
+    logger.info("Uploading %d file(s) to blob storage for project %s", len(pdf_files_info), project_id)
+    blob_client = _get_storage_client()
+    blob_files = []
+    
+    try:
+        for pdf_info in pdf_files_info:
+            blob_url = await blob_client.upload_file_bytes(
+                tenant_id=tenant_id,
+                filename=pdf_info['filename'],
+                file_bytes=pdf_info['bytes'],
+                content_type="application/pdf"
+            )
+            blob_files.append({
+                "filename": pdf_info['filename'],
+                "blob_url": blob_url,
+                "size_mb": pdf_info['size_mb']
+            })
+            logger.debug("File uploaded to blob storage: %s", blob_url)
+    except Exception as exc:
+        logger.exception("Failed to upload files to blob storage: %s", exc)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Failed to upload files to storage. Please try again."
         )
-        parsed_report_doc = {
-            "tenant_id": tenant_id,
-            "project_id": project_id,
-            "report_id": report_id,
-            "blob_url": blob_url,
-            "parsing_time_seconds": parsing_time_seconds,
-            "confidence_score": validated_confidence,
-            "confidence_summary": validated_summary,
-            "total_size_mb": round(total_size_mb, 2),
-            "files_processed": len(pdf_files),
-            "successful_parses": len(parsed_results),
-            "failed_parses": len(pdf_files) - len(parsed_results),
-            "parsed_data": clean_parsed_data or consolidated_data,
-            "status": "completed",
-            "message": f"Successfully processed {len(parsed_results)} of {len(pdf_files)} PDF file(s) in {parsing_time_seconds}s.",
-            "created_at": time.time(),
-        }
-        if update_record:
-            await parsed_reports_collection.update_one(
-                 {"_id": ObjectId(job_id)},
-                 {"$set": parsed_report_doc}
-            )
-            # Ensure webhook_meta is not lost after update
-            await parsed_reports_collection.update_one(
-                {"_id": ObjectId(job_id)},
-                {"$setOnInsert": {"webhook_meta": {
-                    "delivered": False,
-                    "status": "pending",
-                    "webhook_url": webhook_url
-                }}}
-            )
-        else:
-            await parsed_reports_collection.insert_one(parsed_report_doc)
 
-        # send webhook on success if provided
-        if webhook_url:
-            try:
-                # fetch latest doc for completeness (or use parsed_report_doc)
-                try:
-                    latest_doc = await parsed_reports_collection.find_one({"_id": ObjectId(job_id)})
-                    parsed_data_only = latest_doc.get("parsed_data")
-                except Exception:
-                    latest_doc = parsed_report_doc
-                async with httpx.AsyncClient(timeout=10.0) as client:
-                    response = await client.post(webhook_url, json={
-                        "tenant_id": tenant_id,
-                        "project_id": project_id,
-                        "job_id": job_id,
-                        "status": parsed_report_doc.get("status", "completed"),
-                        "report": parsed_data_only
-                    })
-                    if response.status_code >= 200 and response.status_code < 300:
-                        logger.info("Webhook delivered successfully to %s (status: %d)", webhook_url, response.status_code)
-                        await parsed_reports_collection.update_one(
-                            {"_id": ObjectId(job_id)},
-                            {"$set": {"webhook_meta.delivered": True, "webhook_meta.status": "success", "webhook_meta.webhook_url": webhook_url}}
-                        )
-                    else:
-                        logger.warning("Webhook delivery failed to %s (status: %d)", webhook_url, response.status_code)
-                        await parsed_reports_collection.update_one(
-                            {"_id": ObjectId(job_id)},
-                            {"$set": {"webhook_meta.delivered": False, "webhook_meta.status": f"fail ({response.status_code})", "webhook_meta.webhook_url": webhook_url}}
-                        )
-            except Exception as e:
-                logger.warning("Failed to POST success webhook to %s: %s", webhook_url, e)
-                await parsed_reports_collection.update_one(
-                    {"_id": ObjectId(job_id)},
-                    {"$set": {"webhook_meta.delivered": False, "webhook_meta.status": f"fail ({str(e)[:100]})", "webhook_meta.webhook_url": webhook_url}}
-                )
+    # Generate unique identifiers
+    report_object_id = ObjectId()
+    report_id = str(report_object_id)
 
-    # For async: Immediately persist with status "pending", then queue parsing
-    result = await parsed_reports_collection.insert_one({
+    # Create job entry with pending status
+    job_doc = {
         "tenant_id": tenant_id,
         "project_id": project_id,
         "report_id": report_id,
+        "files": blob_files,
+        "total_size_mb": round(total_size_mb, 2),
         "status": "pending",
-        "message": "Parsing queued",
-        "created_at": time.time(),
-        "webhook_meta": { 
+        "message": "Parsing queued - waiting for background worker",
+        "files_processed": 0,
+        "successful_parses": 0,
+        "failed_parses": 0,
+        "retry_count": 0,
+        "max_retries": 3,
+        "model_id": ai_model_id,
+        "model_name": ai_model.get("model_name"),
+        "webhook_meta": {
             "delivered": False,
             "status": "pending",
-            "webhook_url": webhook_url
-        }
-    })
+            "webhook_url": webhook_url,
+            "last_attempt_at": None,
+            "attempts": 0
+        },
+        "created_at": time.time(),
+        "started_at": None,
+        "completed_at": None,
+    }
+
+    result = await jobs_collection.insert_one(job_doc)
     job_id = str(result.inserted_id)
-    asyncio.create_task(do_parsing_and_save(job_id, update_record=True))
-    return {"success": True, "job_id": job_id, "status": "pending", "message": "Parsing queued", "callback_url": webhook_url}
+
+    logger.info("Created parsing job %s for tenant %s, project %s (files: %d)", 
+               job_id, tenant_id, project_id, len(blob_files))
+
+    return {
+        "success": True,
+        "job_id": job_id,
+        "report_id": report_id,
+        "status": "pending",
+        "message": "Report upload successful. Parsing will begin shortly.",
+        "files_uploaded": len(blob_files),
+        "total_size_mb": round(total_size_mb, 2),
+        "webhook_url": webhook_url
+    }
 
 
 
 @router.get(
-    "/job/status/{Job_id}",
-    summary="Get report processing status (Job Status)",
-    description="Fetch the current status of a report being processed asynchronously. Use report_id as the job ID.",
+    "/job/status/{job_id}",
+    summary="Get report processing status",
+    description="Fetch the current status of a report being processed asynchronously.",
 )
 async def get_report_status(
-    Job_id: str,
+    job_id: str,
     auth: AuthenticatedTenant = Depends(resolve_tenant),
 ):
     """
-    Get the processing status of a report by report_id (job_id).
+    Get the processing status of a report by job_id.
     
     Returns:
-    - status: "pending", "completed", or "failed"
+    - status: "pending", "processing", "completed", or "failed"
     - message: Human-readable status message
     - parsing_time_seconds: Time taken to parse (if completed)
     - confidence_score: Confidence of parsed data (if completed)
@@ -323,35 +275,66 @@ async def get_report_status(
     - webhook_delivered: Whether webhook was successfully delivered (if applicable)
     """
     db = await MongoDBClient.get_database()
-    parsed_reports_collection = db["parsed_reports"]
+    jobs_collection = db["parsing_jobs"]
 
     try:
-        report = await parsed_reports_collection.find_one({"_id": ObjectId(Job_id)})
+        job = await jobs_collection.find_one({"_id": ObjectId(job_id)})
 
-        if not report:
+        if not job:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
-                detail=f"Job '{Job_id}' not found or access denied.",
+                detail=f"Job '{job_id}' not found.",
             )
 
         # Build status response
-        status_response = {
-            "job_id": Job_id,
-            "Parsing status": report.get("status", "unknown"),
-            "message": report.get("message", ""),
-            "created_at": report.get("created_at"),
-            "weebhook_meta": report.get("webhook_meta", None),
+        response = {
+            "job_id": job_id,
+            "report_id": job.get("report_id"),
+            "status": job.get("status", "unknown"),
+            "message": job.get("message", ""),
+            "created_at": job.get("created_at"),
+            "started_at": job.get("started_at"),
+            "completed_at": job.get("completed_at"),
         }
 
-        return status_response
+        # Add parsing details if available
+        if job.get("status") in ["completed", "processing"]:
+            response["files_processed"] = job.get("files_processed", 0)
+            response["successful_parses"] = job.get("successful_parses", 0)
+            response["failed_parses"] = job.get("failed_parses", 0)
+            response["parsing_time_seconds"] = job.get("parsing_time_seconds")
+            response["confidence_score"] = job.get("confidence_score")
+            response["confidence_summary"] = job.get("confidence_summary")
+
+        # Add parsed data if completed
+        if job.get("status") == "completed" and job.get("parsed_data"):
+            response["parsed_data"] = job.get("parsed_data")
+
+        # Add retry info if failed
+        if job.get("status") == "failed":
+            response["retry_count"] = job.get("retry_count", 0)
+            response["max_retries"] = job.get("max_retries", 3)
+            response["last_error"] = job.get("last_error")
+
+        # Add webhook delivery status
+        webhook_meta = job.get("webhook_meta")
+        if webhook_meta:
+            response["webhook_status"] = {
+                "delivered": webhook_meta.get("delivered", False),
+                "status": webhook_meta.get("status", "pending"),
+                "attempts": webhook_meta.get("attempts", 0),
+                "last_attempt_at": webhook_meta.get("last_attempt_at"),
+            }
+
+        return response
 
     except HTTPException:
         raise
     except Exception as exc:
-        logger.exception("Failed to fetch report status '%s' for tenant %s: %s", Job_id, exc)
+        logger.exception("Failed to fetch job status '%s': %s", job_id, exc)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Unable to fetch report status at this time.",
+            detail="Unable to fetch job status at this time.",
         ) from exc
 
 

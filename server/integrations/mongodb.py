@@ -70,6 +70,23 @@ class MongoDBClient:
             await analytics.create_index([("timestamp", DESCENDING)])
             logger.info("Created indexes for analytics collection")
             
+            # Parsing jobs collection indexes
+            parsing_jobs = db["parsing_jobs"]
+            await parsing_jobs.create_index([("tenant_id", ASCENDING)])
+            await parsing_jobs.create_index([("status", ASCENDING)])
+            await parsing_jobs.create_index([("status", ASCENDING), ("created_at", ASCENDING)])
+            await parsing_jobs.create_index([("created_at", DESCENDING)])
+            await parsing_jobs.create_index([("retry_count", ASCENDING)])
+            logger.info("Created indexes for parsing_jobs collection")
+            
+            # Parsed reports collection indexes
+            parsed_reports = db["parsed_reports"]
+            await parsed_reports.create_index([("tenant_id", ASCENDING)])
+            await parsed_reports.create_index([("project_id", ASCENDING)])
+            await parsed_reports.create_index([("job_id", ASCENDING)])
+            await parsed_reports.create_index([("created_at", DESCENDING)])
+            logger.info("Created indexes for parsed_reports collection")
+            
         except OperationFailure as e:
             logger.warning(f"Index creation warning (may already exist): {e}")
     

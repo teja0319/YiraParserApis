@@ -250,6 +250,142 @@ class MultiTenantAzureBlobClient:
             logger.error(f"Error deleting report: {str(e)}")
             raise
 
+    async def upload_file_bytes(
+        self,
+        tenant_id: str,
+        filename: str,
+        file_bytes: bytes,
+        content_type: str = "application/pdf"
+    ) -> str:
+        """
+        Upload raw file bytes to blob storage
+        
+        Args:
+            tenant_id: Tenant identifier
+            filename: Original filename
+            file_bytes: File content as bytes
+            content_type: MIME type of the file
+        
+        Returns:
+            str: Blob URL for accessing the file
+        """
+        try:
+            self._assert_tenant_scope(tenant_id)
+            
+            # Create tenant-specific blob path
+            timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+            safe_filename = filename.replace(" ", "_")
+            blob_name = f"{tenant_id}/{timestamp}_{safe_filename}"
+            
+            # Get blob client and upload
+            blob_client = self.container_client.get_blob_client(blob_name)
+            blob_client.upload_blob(file_bytes, overwrite=True)
+            
+            # Set metadata
+            metadata = {
+                "tenant_id": tenant_id,
+                "original_filename": filename,
+                "upload_date": datetime.utcnow().isoformat(),
+                "content_type": content_type,
+                "file_size_bytes": str(len(file_bytes))
+            }
+            blob_client.set_blob_metadata(metadata)
+            
+            # Get blob URL
+            blob_url = blob_client.url
+            logger.info(f"Uploaded file to blob storage: {blob_name} (URL: {blob_url})")
+            
+            return blob_url
+            
+        except Exception as e:
+            logger.error(f"Error uploading file bytes: {str(e)}")
+            raise
+    
+    async def download_file_bytes(
+        self,
+        blob_url: str,
+        tenant_id: str
+    ) -> bytes:
+        """
+        Download file bytes from blob storage by URL
+        
+        Args:
+            blob_url: Full blob URL
+            tenant_id: Tenant identifier for security check
+        
+        Returns:
+            bytes: File content
+        
+        Raises:
+            Exception: If blob not found or access denied
+        """
+        try:
+            self._assert_tenant_scope(tenant_id)
+            
+            # Extract blob name from URL
+            # URL format: https://<account>.blob.core.windows.net/<container>/<blob_path>
+            try:
+                blob_name = blob_url.split(f"{self.container_client.container_name}/", 1)[1]
+            except IndexError:
+                raise ValueError(f"Invalid blob URL format: {blob_url}")
+            
+            # Security check: ensure blob belongs to tenant
+            if not blob_name.startswith(f"{tenant_id}/"):
+                raise Exception("Access denied: Blob does not belong to this tenant")
+            
+            # Download blob
+            blob_client = self.container_client.get_blob_client(blob_name)
+            
+            if not blob_client.exists():
+                raise Exception(f"Blob not found: {blob_name}")
+            
+            file_bytes = blob_client.download_blob().readall()
+            logger.info(f"Downloaded file from blob storage: {blob_name}")
+            
+            return file_bytes
+            
+        except Exception as e:
+            logger.error(f"Error downloading file bytes: {str(e)}")
+            raise
+    
+    async def delete_blob_by_url(
+        self,
+        blob_url: str,
+        tenant_id: str
+    ):
+        """
+        Delete a blob by its URL
+        
+        Args:
+            blob_url: Full blob URL
+            tenant_id: Tenant identifier for security check
+        
+        Raises:
+            Exception: If access denied
+        """
+        try:
+            self._assert_tenant_scope(tenant_id)
+            
+            # Extract blob name from URL
+            try:
+                blob_name = blob_url.split(f"{self.container_client.container_name}/", 1)[1]
+            except IndexError:
+                raise ValueError(f"Invalid blob URL format: {blob_url}")
+            
+            # Security check
+            if not blob_name.startswith(f"{tenant_id}/"):
+                raise Exception("Access denied: Blob does not belong to this tenant")
+            
+            # Delete blob
+            blob_client = self.container_client.get_blob_client(blob_name)
+            if blob_client.exists():
+                blob_client.delete_blob()
+                logger.info(f"Deleted blob: {blob_name}")
+            
+        except Exception as e:
+            logger.error(f"Error deleting blob by URL: {str(e)}")
+            raise
+
     @staticmethod
     def _assert_tenant_scope(tenant_id: str) -> None:
         """Ensure the tenant context matches the requested tenant."""

@@ -96,5 +96,23 @@
       "request": 52,
       "get_report": 2
     }
+  },
+  "new-version-5e8a": {
+    "total_uploads": 9,
+    "total_storage_mb": 10.401792526245117,
+    "total_api_calls": 38,
+    "total_reports_generated": 0,
+    "last_activity": "2025-11-14T02:38:26.182923",
+    "monthly_usage": {
+      "2025-11": {
+        "uploads": 9,
+        "storage_mb": 10.401792526245117,
+        "api_calls": 38,
+        "reports_generated": 0
+      }
+    },
+    "endpoint_counters": {
+      "request": 38
+    }
   }
 }
