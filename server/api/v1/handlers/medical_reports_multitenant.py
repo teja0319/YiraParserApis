@@ -115,14 +115,14 @@ async def upload_report(
     if not ai_model_id:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail=f"Project '{project_id}' has no AI model assigned. Please contact contact@yira.ai"
+            detail=f"Project has no access. Please contact contact@yira.ai"
         )
 
     ai_model = await ai_models_collection.find_one({"model_id": ai_model_id, "tenant_id": tenant_id})
     if not ai_model:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"AI model '{ai_model_id}' not found"
+            detail=f"Project has no access. Please contact contact@yira.ai"
         )
 
     # Process uploaded files: extract PDFs from ZIP if needed
@@ -302,13 +302,13 @@ async def get_report_status(
             response["files_processed"] = job.get("files_processed", 0)
             response["successful_parses"] = job.get("successful_parses", 0)
             response["failed_parses"] = job.get("failed_parses", 0)
-            response["parsing_time_seconds"] = job.get("parsing_time_seconds")
-            response["confidence_score"] = job.get("confidence_score")
-            response["confidence_summary"] = job.get("confidence_summary")
+            # response["parsing_time_seconds"] = job.get("parsing_time_seconds")
+            # response["confidence_score"] = job.get("confidence_score")
+            # response["confidence_summary"] = job.get("confidence_summary")
 
         # Add parsed data if completed
-        if job.get("status") == "completed" and job.get("parsed_data"):
-            response["parsed_data"] = job.get("parsed_data")
+        # if job.get("status") == "completed" and job.get("parsed_data"):
+        #     response["parsed_data"] = job.get("parsed_data")
 
         # Add retry info if failed
         if job.get("status") == "failed":
