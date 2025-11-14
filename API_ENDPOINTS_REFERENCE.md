@@ -112,6 +112,7 @@ Body: {
 
 ### List Projects
 \`\`\`
+
 GET /api/v1/tenants/{tenant_id}/projects
 Headers: X-API-Key
 Query: ?active_only=false

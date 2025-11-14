@@ -323,7 +323,7 @@ async def get_report_status(
                 "delivered": webhook_meta.get("delivered", False),
                 "status": webhook_meta.get("status", "pending"),
                 "attempts": webhook_meta.get("attempts", 0),
-                "last_attempt_at": webhook_meta.get("last_attempt_at"),
+                #"last_attempt_at": webhook_meta.get("last_attempt_at"),
             }
 
         return response
