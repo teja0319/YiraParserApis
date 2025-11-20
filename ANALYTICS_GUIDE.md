@@ -434,7 +434,7 @@ pipeline = [
             "avg_cost_per_page": {"$avg": "$cost_per_page"},
             "avg_parsing_time": {"$avg": "$average_parsing_time_seconds"},
             "avg_success_rate": {"$avg": "$success_rate"},
-            "latest_timestamp": {"$max": "$timestamp"},
+            "latest_ mp": {"$max": "$timestamp"},
         }
     }
 ]
@@ -597,6 +597,138 @@ ai_model_config = {
 
 ---
 
+## Database Operations Optimization
+
+### Problem Statement
+
+The analytics system tracks metrics across multiple MongoDB collections. Naive approaches to synchronizing raw events to aggregated summaries require:
+- N insert operations (one per PDF)
+- 2 aggregation pipeline reads (one per collection sync)
+- 2 update operations (one per aggregate)
+
+**Total Database Hits (N=3 PDFs): 9 operations**
+
+### Solution: Optimized Batch Updates
+
+The system implements three optimization methods to reduce database hits while maintaining all analytics metrics and historical audit trails.
+
+#### Method 1: Direct Atomic Updates (Implemented)
+
+The system uses MongoDB atomic operators (`$inc`, `$push`, `$set`) to directly update aggregates without reading back:
+
+**Benefits:**
+- ✅ Eliminates aggregation pipeline reads
+- ✅ Uses atomic operations (guaranteed consistency)
+- ✅ Appends metrics to arrays for per-document tracking
+- ✅ Single write per collection
+
+**Implementation:**
+
+```python
+# Update ProjectAnalytics with atomic operators
+await project_analytics_collection.update_one(
+    {"project_id": project_id, "tenant_id": tenant_id},
+    {
+        "$inc": {
+            "total_uploads": 1,           # Increment by 1
+            "total_pages": total_pages,   # Increment by batch total
+        },
+        "$push": {
+            "pages_per_doc": {"$each": pages_list},          # Append pages array
+            "parse_times": {"$each": parse_times_list},      # Append times array
+            "success_rates": {"$each": success_rates_list},  # Append rates array
+        },
+        "$set": {
+            "project_name": project_name,                # Set project name
+            "avg_parse_time_seconds": avg_parse_time,   # Set average
+            "average_success_rate": avg_success_rate,   # Set average
+            "last_updated": datetime.utcnow(),          # Update timestamp
+        }
+    },
+    upsert=True
+)
+```
+
+**Code Reference:** `server/utils/analytics_tracker.py` - `track_batch_and_update_aggregates()` method
+
+**Result:** 
+- ✅ **Database hits reduced from 9 to 5 (44% reduction)**
+- ✅ **No aggregation reads needed**
+- ✅ **Audit trail maintained in analytics collection**
+- ✅ **Per-document metrics stored in arrays**
+
+#### How It Works - Step by Step
+
+**Upload Scenario: User uploads 3 PDFs in single request**
+
+```
+1. WRITE 1: Insert Analytics Events (Audit Trail)
+   ├─ Insert doc 1: pages=15, time=1.15s, success=100%
+   ├─ Insert doc 2: pages=20, time=1.30s, success=100%
+   └─ Insert doc 3: pages=18, time=1.10s, success=100%
+   → 3 inserts to analytics collection (0 reads)
+
+2. WRITE 2: Update ProjectAnalytics (Atomic, No Read)
+   ├─ Calculate: total_pages=53, avg_time=1.18s, avg_success=100%
+   ├─ $inc total_uploads: 1
+   ├─ $inc total_pages: 53
+   ├─ $push pages_per_doc: [15, 20, 18]
+   ├─ $push parse_times: [1.15, 1.30, 1.10]
+   ├─ $push success_rates: [100, 100, 100]
+   └─ $set averages and timestamp
+   → 1 atomic update (0 reads, upsert if first time)
+
+3. WRITE 3: Update TenantAnalytics (Atomic, No Read)
+   ├─ $inc total_uploads: 1
+   └─ $set last_updated: now
+   → 1 atomic update (0 reads, upsert if first time)
+
+TOTAL: 5 database operations (3 inserts + 2 updates, 0 reads)
+```
+
+#### Comparison with Alternative Methods
+
+| Method | Reads | Writes | Total (N=3) | Strengths | Trade-offs |
+|--------|-------|--------|------------|-----------|-----------|
+| **Aggregation Pipeline Sync** | 2 | N+2 | 9 | Simple logic | Many reads, slower |
+| **Direct Atomic Updates** ✅ | 0 | N+2 | 5 | Fast, atomic, no reads | Need to maintain arrays |
+| **MongoDB $merge Pipeline** | 0 | N+1 | 4 | Server-side processing | MongoDB 4.4+ required |
+| **Message Queue (Async)** | 0 | Deferred | Deferred | Non-blocking, scales | Eventual consistency |
+
+**Current Implementation:** Direct Atomic Updates - best balance of simplicity and performance
+
+#### Per-Document Metrics Arrays
+
+The optimized system maintains arrays for detailed per-document analysis:
+
+**ProjectAnalytics Structure (Updated):**
+```json
+{
+  "project_id": "dental_clinic",
+  "tenant_id": "clinic_tenant",
+  
+  "total_uploads": 3,
+  "total_pages": 53,
+  "pages_per_doc": [15, 20, 18],                          // Per-PDF pages
+  
+  "avg_parse_time_seconds": 1.18,
+  "parse_times": [1.15, 1.30, 1.10],                      // Per-PDF times
+  
+  "average_success_rate": 100.0,
+  "success_rates": [100, 100, 100],                       // Per-PDF rates
+  
+  "last_updated": ISODate("2025-11-14T14:35:00Z")
+}
+```
+
+**Advantages:**
+- Individual metrics accessible for detailed review
+- Averages automatically calculated from arrays
+- Complete audit trail of per-PDF performance
+- No separate queries needed for granular data
+
+---
+
 ## MongoDB Collections
 
 ### Analytics Collection (Raw Events)
@@ -648,7 +780,7 @@ ai_model_config = {
 
 **Database:** `MEDPARSER`
 
-**Purpose:** One document per project - aggregated project-level summary
+**Purpose:** One document per project - aggregated project-level summary with per-document metrics
 
 **Document Schema:**
 
@@ -657,12 +789,17 @@ ai_model_config = {
 | `_id` | ObjectId | MongoDB auto-generated ID | ObjectId("...") |
 | `project_id` | String | Project identifier | "proj_001" |
 | `tenant_id` | String | Tenant identifier | "hosp_001" |
-| `timestamp` | ISODate | When last updated | ISODate("2025-11-12T15:30:00Z") |
-| `uploads_count` | Number | Total uploads for project | 5 |
-| `total_pages_processed` | Number | Total pages for project | 75 |
-| `average_cost_per_page` | Number | Average cost across all uploads | 0.05 |
-| `average_parsing_time_seconds` | Number | Average parsing time | 2.18 |
-| `success_rate` | Number | Success rate percentage | 100.0 |
+| `project_name` | String | Project display name | "Dental Clinic" |
+| `total_uploads` | Number | Total upload sessions | 5 |
+| `total_pages` | Number | Total pages across all PDFs | 75 |
+| `pages_per_doc` | Array | Page count for each PDF | [15, 20, 18, 12, 10] |
+| `avg_parse_time_seconds` | Number | Average parse time across all PDFs | 2.18 |
+| `avg_parse_time_per_doc_seconds` | Number | Average parse time per document | 2.18 |
+| `parse_times` | Array | Parse time for each PDF (seconds) | [1.15, 2.30, 1.20, 2.10, 1.95] |
+| `average_success_rate` | Number | Average success rate percentage | 100.0 |
+| `success_rates` | Array | Success rate for each PDF | [100, 100, 95, 100, 100] |
+| `timestamp` | ISODate | When created | ISODate("2025-11-12T15:30:00Z") |
+| `last_updated` | ISODate | When last updated | ISODate("2025-11-12T15:35:00Z") |
 
 **Sample Document:**
 ```json
@@ -670,12 +807,17 @@ ai_model_config = {
   "_id": ObjectId("507f1f77bcf86cd799439012"),
   "project_id": "proj_2024_001",
   "tenant_id": "hosp_001",
+  "project_name": "Dental Clinic",
+  "total_uploads": 5,
+  "total_pages": 75,
+  "pages_per_doc": [15, 20, 18, 12, 10],
+  "avg_parse_time_seconds": 2.18,
+  "avg_parse_time_per_doc_seconds": 2.18,
+  "parse_times": [1.15, 2.30, 1.20, 2.10, 1.95],
+  "average_success_rate": 100.0,
+  "success_rates": [100, 100, 95, 100, 100],
   "timestamp": ISODate("2025-11-12T15:30:00Z"),
-  "uploads_count": 5,
-  "total_pages_processed": 75,
-  "average_cost_per_page": 0.05,
-  "average_parsing_time_seconds": 2.18,
-  "success_rate": 100.0
+  "last_updated": ISODate("2025-11-12T15:35:00Z")
 }
 ```
 
@@ -693,26 +835,22 @@ ai_model_config = {
 |-------|------|-------------|---------|
 | `_id` | ObjectId | MongoDB auto-generated ID | ObjectId("...") |
 | `tenant_id` | String | Tenant identifier | "hosp_001" |
-| `timestamp` | ISODate | When last updated | ISODate("2025-11-12T15:30:00Z") |
 | `total_projects` | Number | Total active projects | 3 |
-| `total_uploads` | Number | Total uploads across all projects | 12 |
-| `total_pages_processed` | Number | Total pages across all projects | 187 |
-| `average_cost_per_page` | Number | Average cost across all projects | 0.05 |
-| `average_parsing_time_seconds` | Number | Average parsing time across all projects | 2.25 |
+| `total_uploads` | Number | Total upload sessions across all projects | 12 |
 | `average_success_rate` | Number | Average success rate across all projects | 99.8 |
+| `timestamp` | ISODate | When created | ISODate("2025-11-12T15:30:00Z") |
+| `last_updated` | ISODate | When last updated | ISODate("2025-11-12T15:35:00Z") |
 
 **Sample Document:**
 ```json
 {
   "_id": ObjectId("507f1f77bcf86cd799439013"),
   "tenant_id": "hosp_001",
-  "timestamp": ISODate("2025-11-12T15:30:00Z"),
   "total_projects": 3,
   "total_uploads": 12,
-  "total_pages_processed": 187,
-  "average_cost_per_page": 0.05,
-  "average_parsing_time_seconds": 2.25,
-  "average_success_rate": 99.8
+  "average_success_rate": 99.8,
+  "timestamp": ISODate("2025-11-12T15:30:00Z"),
+  "last_updated": ISODate("2025-11-12T15:35:00Z")
 }
 ```
 

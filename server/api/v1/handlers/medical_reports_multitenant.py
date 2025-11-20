@@ -223,11 +223,26 @@ async def upload_report(
             
             if len(pdf_files) > 1:
                 logger.info("Parsing %d PDFs together for accurate cross-document photo comparison", len(pdf_files))
+                batch_parse_start = time.time()
                 try:
                     consolidated_data = gemini_client.parse_multiple_pdfs(pdf_files)
+                    batch_parse_end = time.time()
+                    batch_parse_time = round(batch_parse_end - batch_parse_start, 2)
                     if consolidated_data:
                         logger.info("Successfully parsed %d PDFs together", len(pdf_files))
-                        parsed_results = [{'filename': pdf['filename'], 'data': consolidated_data} for pdf in pdf_files]
+                        # For batch parsing, extract total pages and divide time equally across PDFs
+                        total_pages_batch = consolidated_data.get("total_pages", len(pdf_files))
+                        pages_per_pdf = total_pages_batch // len(pdf_files) if len(pdf_files) > 0 else 1
+                        time_per_pdf = round(batch_parse_time / len(pdf_files), 2)
+                        parsed_results = [
+                            {
+                                'filename': pdf['filename'],
+                                'data': consolidated_data,
+                                'pages': pages_per_pdf,
+                                'parse_time': time_per_pdf,
+                            }
+                            for pdf in pdf_files
+                        ]
                 except Exception as exc:
                     logger.error("Batch parsing failed: %s. Falling back to individual parsing.", exc)
                     consolidated_data = None
@@ -237,12 +252,18 @@ async def upload_report(
                 parsed_results = []
                 for pdf_file in pdf_files:
                     logger.info("Parsing PDF '%s' for project '%s'", pdf_file['filename'], project_id)
+                    pdf_parse_start = time.time()
                     try:
                         parsed_data = gemini_client.parse_pdf(pdf_file['bytes'], pdf_file['filename'])
+                        pdf_parse_end = time.time()
+                        pdf_parse_time = round(pdf_parse_end - pdf_parse_start, 2)
                         if parsed_data:
+                            pages_in_pdf = parsed_data.get("total_pages", 1)
                             parsed_results.append({
                                 'filename': pdf_file['filename'],
                                 'data': parsed_data,
+                                'pages': pages_in_pdf,
+                                'parse_time': pdf_parse_time,
                             })
                     except Exception as exc:
                         logger.warning("Failed to parse PDF '%s': %s", pdf_file['filename'], exc)
@@ -361,56 +382,23 @@ async def upload_report(
             except Exception as db_exc:
                 logger.warning("Failed to store parsed report in DB: %s", db_exc)
 
-            # Track analytics for this parsing event
+            # Track analytics for all PDFs with optimized database writes
             try:
-                logger.info("🔍 Starting analytics tracking for report %s...", report_id)
+                logger.info("🔍 Starting optimized analytics tracking for %d PDF(s) in report %s...", len(parsed_results), report_id)
                 
-                # Count total pages from parsed data (if available)
-                pages_processed = 1  # Default to 1 page
-                if parsed_report_doc.get("parsed_data"):
-                    # Try to extract page count from parsed data if available
-                    parsed_data = parsed_report_doc["parsed_data"]
-                    if isinstance(parsed_data, dict) and "total_pages" in parsed_data:
-                        pages_processed = int(parsed_data.get("total_pages", 1))
-                
-                logger.info(f"📄 Pages to track: {pages_processed}")
-                
-                # Get AI model cost per page
-                cost_per_page = ai_model.get("cost_per_page", 0.0)
-                logger.info(f"💰 Cost per page: ${cost_per_page}")
-                
-                logger.info(f"📊 Calling analytics_tracker.track_report_parse() with:")
-                logger.info(f"   - tenant_id: {tenant_id}")
-                logger.info(f"   - project_id: {project_id}")
-                logger.info(f"   - pages_processed: {pages_processed}")
-                logger.info(f"   - parsing_time_seconds: {parsing_time_seconds}")
-                logger.info(f"   - cost_per_page: {cost_per_page}")
-                
-                # Track the analytics event
-                track_result = await analytics_tracker.track_report_parse(
+                # Use optimized batch tracking (no cost_per_page)
+                # This inserts audit trail events and directly updates aggregates
+                track_result = await analytics_tracker.track_batch_and_update_aggregates(
                     tenant_id=tenant_id,
                     project_id=project_id,
-                    pages_processed=pages_processed,
-                    parsing_time_seconds=parsing_time_seconds,
-                    cost_per_page=cost_per_page,
-                    success=True,
+                    project_name=project.get("project_name", project_id),
+                    parsed_results=parsed_results,
                 )
                 
                 if track_result:
-                    logger.info("✅ Analytics tracked successfully for report %s", report_id)
+                    logger.info(f"✅ Analytics tracked and aggregates updated for all {len(parsed_results)} PDFs in report {report_id}")
                 else:
-                    logger.warning("⚠️  Analytics tracking returned False for report %s", report_id)
-                
-                # Sync aggregated analytics to ProjectAnalytics and TenantAnalytics collections
-                try:
-                    logger.info("🔄 Syncing ProjectAnalytics and TenantAnalytics...")
-                    await analytics_tracker.sync_project_analytics(tenant_id, project_id)
-                    await analytics_tracker.sync_tenant_analytics(tenant_id)
-                    logger.info("✅ Analytics synced to ProjectAnalytics and TenantAnalytics collections")
-                except Exception as sync_exc:
-                    logger.warning("⚠️  Failed to sync analytics collections: %s", sync_exc)
-                    logger.exception("Sync exception details:")
-                    # Don't fail the request if sync fails
+                    logger.warning(f"⚠️  Analytics tracking failed for report {report_id}")
                     
             except Exception as analytics_exc:
                 logger.warning("❌ Failed to track analytics for report %s: %s", report_id, analytics_exc)

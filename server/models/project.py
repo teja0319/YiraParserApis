@@ -48,15 +48,29 @@ class Project(BaseModel):
 
 
 class ProjectAnalytics(BaseModel):
-    """Project-level analytics"""
+    """Project-level analytics with per-document metrics"""
     project_id: str = Field(..., description="Project ID")
     tenant_id: str = Field(..., description="Tenant ID")
+    project_name: str = Field(default="", description="Project display name")
+    
+    # Upload metrics
+    total_uploads: int = Field(default=0, description="Number of upload sessions")
+    
+    # Page metrics
+    total_pages: int = Field(default=0, description="Total pages across all documents")
+    pages_per_doc: List[int] = Field(default_factory=list, description="Page count for each document")
+    
+    # Parse time metrics
+    avg_parse_time_seconds: float = Field(default=0.0, description="Average parse time across all documents")
+    avg_parse_time_per_doc_seconds: float = Field(default=0.0, description="Average parse time per document")
+    parse_times: List[float] = Field(default_factory=list, description="Parse time for each document")
+    
+    # Success rate metrics
+    average_success_rate: float = Field(default=100.0, description="Average success rate percentage")
+    success_rates: List[float] = Field(default_factory=list, description="Success rate for each document")
+    
     timestamp: datetime = Field(default_factory=datetime.utcnow)
-    uploads_count: int = Field(default=0, description="Number of uploads")
-    total_pages_processed: int = Field(default=0, description="Total pages parsed")
-    total_cost_usd: float = Field(default=0.0, description="Total cost in USD")
-    average_parsing_time_seconds: float = Field(default=0.0, description="Average parsing time")
-    success_rate: float = Field(default=100.0, description="Success rate percentage")
+    last_updated: datetime = Field(default_factory=datetime.utcnow)
     
     class Config:
         json_encoders = {
@@ -67,12 +81,11 @@ class ProjectAnalytics(BaseModel):
 class TenantAnalytics(BaseModel):
     """Tenant-level aggregated analytics"""
     tenant_id: str = Field(..., description="Tenant ID")
-    timestamp: datetime = Field(default_factory=datetime.utcnow)
     total_projects: int = Field(default=0, description="Total number of projects")
     total_uploads: int = Field(default=0, description="Total uploads across all projects")
-    total_pages_processed: int = Field(default=0, description="Total pages parsed across all projects")
-    total_cost_usd: float = Field(default=0.0, description="Total cost in USD across all projects")
-    active_projects: int = Field(default=0, description="Number of active projects")
+    average_success_rate: float = Field(default=100.0, description="Average success rate across all projects")
+    timestamp: datetime = Field(default_factory=datetime.utcnow)
+    last_updated: datetime = Field(default_factory=datetime.utcnow)
     
     class Config:
         json_encoders = {
