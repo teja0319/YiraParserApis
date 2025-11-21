@@ -17,6 +17,8 @@ from server.integrations.gemini import GeminiParser
 from server.config.settings import get_settings
 from server.models.parsing_job import JobStatus, ParsingJob, BlobFileInfo
 from server.utils.confidence_calculator import calculate_confidence
+from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile, status
+
 
 logger = logging.getLogger(__name__)
 
@@ -414,11 +416,14 @@ class ParsingWorker:
             
             async with httpx.AsyncClient(timeout=self.WEBHOOK_TIMEOUT_SECONDS) as client:
                 response = await client.post(webhook_url, json=payload)
-                
+                logger.info("Response status: %s", response.status_code)
+                logger.info("Response headers: %s", response.headers)
+                logger.info("Response body: %s", response.text)
+
                 if response.status_code >= 200 and response.status_code < 300:
                     logger.info("Webhook delivered successfully to %s (status: %d)", 
                                webhook_url, response.status_code)
-                    
+
                     await jobs_collection.update_one(
                         {"_id": ObjectId(job_id)},
                         {
@@ -433,10 +438,7 @@ class ParsingWorker:
                 else:
                     logger.warning("Webhook delivery failed to %s (status: %d)", 
                                   webhook_url, response.status_code)
-                    logger.warning("Webhook delivery failed to %s (status: %d)", 
-                                  webhook_url, response)
 
-                    
                     await jobs_collection.update_one(
                         {"_id": ObjectId(job_id)},
                         {
@@ -448,7 +450,7 @@ class ParsingWorker:
                             "$inc": {"webhook_meta.attempts": 1}
                         }
                     )
-        
+            
         except Exception as exc:
             logger.exception("Failed to send webhook to %s: %s", webhook_url, exc)
             
